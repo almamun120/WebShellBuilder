@@ -1,0 +1,125 @@
+name: Android CI
+
+# প্রতিটি push / pull request-এ ডিবাগ + সাইন্ড রিলিজ APK তৈরি হবে।
+# v1.0.0 ধরনের ট্যাগ push করলে GitHub Release-ও তৈরি হবে।
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # Release তৈরির জন্য
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      # Gradle wrapper jar প্রজেক্টে নেই, তাই সরাসরি Gradle 8.7 ব্যবহার হচ্ছে
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Version নির্ধারণ
+        id: ver
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "name=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=1.0.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "code=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      # Secrets না থাকলে স্বয়ংক্রিয় কী একবার তৈরি হয়ে cache-এ থেকে যায়,
+      # ফলে পরের বিল্ডগুলো একই কী দিয়ে সাইন হয় (আপডেট ইনস্টল হয়)।
+      - name: Auto-keystore cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ci-keystore
+          key: auto-keystore-v1
+
+      # --- Release keystore: Secrets থেকে, না থাকলে cache/স্বয়ংক্রিয় কী ---
+      - name: Keystore প্রস্তুত
+        id: ks
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS_S: ${{ secrets.KEY_ALIAS }}
+          KEY_PASS_S: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          KS_PATH="$RUNNER_TEMP/release.jks"
+          if [[ -n "$KS_B64" && -n "$KS_PASS" && -n "$KEY_ALIAS_S" && -n "$KEY_PASS_S" ]]; then
+            echo "$KS_B64" | base64 -d > "$KS_PATH"
+            echo "KEYSTORE_PASSWORD=$KS_PASS" >> "$GITHUB_ENV"
+            echo "KEY_ALIAS=$KEY_ALIAS_S" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=$KEY_PASS_S" >> "$GITHUB_ENV"
+            echo "temporary=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::KEYSTORE_* secrets সেট নেই। স্বয়ংক্রিয় কী ব্যবহার হচ্ছে (cache-এ রাখা; cache মুছে গেলে নতুন কী তৈরি হবে)। দীর্ঘমেয়াদে README দেখে Secrets যোগ করুন।"
+            mkdir -p "$HOME/.ci-keystore"
+            KS_PATH="$HOME/.ci-keystore/release.jks"
+            if [[ ! -f "$KS_PATH" ]]; then
+              keytool -genkeypair -v -keystore "$KS_PATH" -storetype PKCS12 \
+                -storepass tempPass123 -keypass tempPass123 -alias temp \
+                -keyalg RSA -keysize 2048 -validity 10000 \
+                -dname "CN=WebShell Builder CI, O=CI"
+            fi
+            echo "KEYSTORE_PASSWORD=tempPass123" >> "$GITHUB_ENV"
+            echo "KEY_ALIAS=temp" >> "$GITHUB_ENV"
+            echo "KEY_PASSWORD=tempPass123" >> "$GITHUB_ENV"
+            echo "temporary=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "KEYSTORE_FILE=$KS_PATH" >> "$GITHUB_ENV"
+
+      - name: Debug + signed Release বিল্ড
+        run: >
+          gradle :builder:assembleDebug :builder:assembleRelease
+          -PversionName=${{ steps.ver.outputs.name }}
+          -PversionCode=${{ steps.ver.outputs.code }}
+          --stacktrace
+
+      - name: APK গুছিয়ে নাম দেওয়া
+        run: |
+          mkdir -p dist
+          cp builder/build/outputs/apk/debug/*.apk   "dist/WebShellBuilder-${{ steps.ver.outputs.name }}-debug.apk"
+          cp builder/build/outputs/apk/release/*.apk "dist/WebShellBuilder-${{ steps.ver.outputs.name }}-release.apk"
+          ls -la dist
+
+      - name: Release APK সাইন যাচাই
+        run: |
+          APKSIGNER=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          "$APKSIGNER" verify --verbose "dist/WebShellBuilder-${{ steps.ver.outputs.name }}-release.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WebShellBuilder-${{ steps.ver.outputs.name }}
+          path: dist/*.apk
+          if-no-files-found: error
+
+      # প্রতিটি push-এ (PR ছাড়া) স্বয়ংক্রিয়ভাবে GitHub Release তৈরি হয়।
+      # ট্যাগ push করলে সেই ট্যাগই ব্যবহার হয়, নইলে v<ভার্সন> ট্যাগ নিজে তৈরি হয়।
+      - name: GitHub Release (স্বয়ংক্রিয়)
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.name }}
+          name: WebShell Builder ${{ steps.ver.outputs.name }}
+          target_commitish: ${{ github.sha }}
+          files: dist/*.apk
+          generate_release_notes: true
