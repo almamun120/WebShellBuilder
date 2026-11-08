@@ -29,7 +29,13 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - uses: android-actions/setup-android@v3
+      # ubuntu-latest-এ Android SDK আগে থেকেই আছে (ANDROID_HOME)।
+      # android-actions/setup-android 'tools' প্যাকেজ না পেয়ে ফেল করত, তাই সরাসরি sdkmanager ব্যবহার।
+      - name: Android SDK প্যাকেজ
+        run: |
+          SDKM=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-34" "build-tools;34.0.0"
 
       # Gradle wrapper jar প্রজেক্টে নেই, তাই সরাসরি Gradle 8.7 ব্যবহার হচ্ছে
       - uses: gradle/actions/setup-gradle@v4
