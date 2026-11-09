@@ -49,6 +49,22 @@ public final class ApkPacker {
         }
     }
 
+    /**
+     * The template's launcher icons are the only square PNGs of 48/72/96/144/192 px in res/.
+     * They are recognised by their image size, not by their path, because the resource compiler
+     * may rename or move them (shortened resource paths, "-v4" suffixes).
+     *
+     * @return the pixel size to render, or 0 if the entry is not a launcher icon
+     */
+    static int launcherIconSize(String name, byte[] data) {
+        if (!name.startsWith("res/") || !name.endsWith(".png") || data.length < 24) return 0;
+        if ((data[1] & 0xFF) != 'P' || (data[2] & 0xFF) != 'N' || (data[3] & 0xFF) != 'G') return 0;
+        int w = ((data[16] & 0xFF) << 24) | ((data[17] & 0xFF) << 16) | ((data[18] & 0xFF) << 8) | (data[19] & 0xFF);
+        int h = ((data[20] & 0xFF) << 24) | ((data[21] & 0xFF) << 16) | ((data[22] & 0xFF) << 8) | (data[23] & 0xFF);
+        if (w != h) return 0;
+        return (w == 48 || w == 72 || w == 96 || w == 144 || w == 192) ? w : 0;
+    }
+
     static int iconSize(String density) {
         switch (density) {
             case "l": return 36;
@@ -75,13 +91,9 @@ public final class ApkPacker {
                 if (e.isDirectory() || name.startsWith("META-INF/") || name.equals("AndroidManifest.xml")) continue;
                 if (extraFiles.containsKey(name)) continue;
 
-                byte[] data;
-                Matcher m = ICON.matcher(name);
-                if (m.matches()) {
-                    data = iconProvider.apply(iconSize(m.group(1)));
-                } else {
-                    data = readAll(zf.getInputStream(e));
-                }
+                byte[] data = readAll(zf.getInputStream(e));
+                int px = launcherIconSize(name, data);
+                if (px > 0) data = iconProvider.apply(px);
                 boolean stored = name.endsWith(".arsc") || e.getMethod() == ZipEntry.STORED;
                 put(zos, co, name, data, stored);
             }

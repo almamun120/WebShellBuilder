@@ -4,17 +4,27 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.hardware.camera2.CameraManager;
+import android.database.Cursor;
+import android.net.ConnectivityManager;
+import android.net.NetworkCapabilities;
 import android.net.Uri;
+import android.os.BatteryManager;
 import android.os.Build;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
+import android.provider.ContactsContract;
 import android.telephony.SmsManager;
+import android.util.Base64;
 import android.widget.Toast;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /**
  * JavaScript interface, available to the web page as window.Android (and window.WebShell).
@@ -237,5 +247,200 @@ public class Bridge {
         } catch (Exception e) {
             return "{}";
         }
+    }
+
+    // ------------------------------------------------------------------ files
+
+    /** Saves a file to Downloads. {@code base64} may be plain base64 or a data: URL. */
+    @android.webkit.JavascriptInterface
+    public void saveFile(String name, String mime, String base64) {
+        if (!ok()) return;
+        try {
+            byte[] data = decode(base64);
+            a.saveBytes(name, mime, data);
+        } catch (Exception e) {
+            a.downloadFailed();
+        }
+    }
+
+    /** Opens the share sheet with a file. {@code base64} may be plain base64 or a data: URL. */
+    @android.webkit.JavascriptInterface
+    public void shareFile(String name, String mime, String base64) {
+        if (!ok()) return;
+        try {
+            byte[] data = decode(base64);
+            a.runOnUiThread(() -> {
+                try {
+                    FileSaver.share(a, name, mime, data);
+                } catch (Exception e) {
+                    a.downloadFailed();
+                }
+            });
+        } catch (Exception e) {
+            a.downloadFailed();
+        }
+    }
+
+    private static byte[] decode(String s) {
+        if (s == null) return new byte[0];
+        int comma = s.startsWith("data:") ? s.indexOf(',') : -1;
+        return Base64.decode(comma >= 0 ? s.substring(comma + 1) : s, Base64.DEFAULT);
+    }
+
+    // ------------------------------------------------------------------ device info
+
+    /** JSON array: [{"name":"..","numbers":[".."]}]. Needs the "contacts" permission (else "[]"). */
+    @android.webkit.JavascriptInterface
+    public String getContacts() {
+        if (!ok() || !a.granted("contacts")) return "[]";
+        Map<String, JSONArray> map = new LinkedHashMap<>();
+        try (Cursor c = a.getContentResolver().query(ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                new String[]{ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                        ContactsContract.CommonDataKinds.Phone.NUMBER},
+                null, null, ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " COLLATE NOCASE ASC")) {
+            int rows = 0;
+            while (c != null && c.moveToNext() && rows++ < 5000) {
+                String name = c.getString(0);
+                String num = c.getString(1);
+                if (name == null || num == null) continue;
+                JSONArray arr = map.get(name);
+                if (arr == null) {
+                    arr = new JSONArray();
+                    map.put(name, arr);
+                }
+                arr.put(num);
+            }
+        } catch (Exception ignored) {
+        }
+        JSONArray out = new JSONArray();
+        try {
+            for (Map.Entry<String, JSONArray> e : map.entrySet()) {
+                out.put(new JSONObject().put("name", e.getKey()).put("numbers", e.getValue()));
+            }
+        } catch (Exception ignored) {
+        }
+        return out.toString();
+    }
+
+    @android.webkit.JavascriptInterface
+    public String getClipboard() {
+        if (!ok()) return "";
+        try {
+            ClipboardManager cm = (ClipboardManager) a.getSystemService(Context.CLIPBOARD_SERVICE);
+            ClipData d = cm.getPrimaryClip();
+            if (d == null || d.getItemCount() == 0) return "";
+            CharSequence t = d.getItemAt(0).coerceToText(a);
+            return t == null ? "" : t.toString();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /** JSON: {"level":0-100,"charging":true|false}. */
+    @android.webkit.JavascriptInterface
+    public String getBattery() {
+        if (!ok()) return "{}";
+        try {
+            Intent i = a.registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+            int level = i == null ? -1 : i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+            int scale = i == null ? -1 : i.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
+            int status = i == null ? -1 : i.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
+            JSONObject o = new JSONObject();
+            o.put("level", level >= 0 && scale > 0 ? Math.round(level * 100f / scale) : -1);
+            o.put("charging", status == BatteryManager.BATTERY_STATUS_CHARGING
+                    || status == BatteryManager.BATTERY_STATUS_FULL);
+            return o.toString();
+        } catch (Exception e) {
+            return "{}";
+        }
+    }
+
+    /** "wifi" | "cellular" | "ethernet" | "vpn" | "other" | "none". */
+    @android.webkit.JavascriptInterface
+    public String getNetworkType() {
+        if (!ok()) return "none";
+        try {
+            ConnectivityManager cm = (ConnectivityManager) a.getSystemService(Context.CONNECTIVITY_SERVICE);
+            android.net.Network n = cm.getActiveNetwork();
+            if (n == null) return "none";
+            NetworkCapabilities c = cm.getNetworkCapabilities(n);
+            if (c == null) return "none";
+            if (c.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return "wifi";
+            if (c.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) return "cellular";
+            if (c.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) return "ethernet";
+            if (c.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return "vpn";
+            return "other";
+        } catch (Exception e) {
+            return "none";
+        }
+    }
+
+    @android.webkit.JavascriptInterface
+    public boolean isDarkMode() {
+        return ok() && a.isNight();
+    }
+
+    // ------------------------------------------------------------------ UI
+
+    /** Colour like "#1E88E5". */
+    @android.webkit.JavascriptInterface
+    public void setStatusBarColor(String hex) {
+        if (!ok()) return;
+        try {
+            int c = android.graphics.Color.parseColor(hex);
+            a.runOnUiThread(() -> a.setStatusColor(c));
+        } catch (Exception ignored) {
+        }
+    }
+
+    /** Enable/disable pull-to-refresh for the current page (e.g. pages with their own scroll areas). */
+    @android.webkit.JavascriptInterface
+    public void setPullRefresh(boolean on) {
+        if (!ok()) return;
+        a.runOnUiThread(() -> a.pull.setPullEnabled(on));
+    }
+
+    // ------------------------------------------------------------------ scanner / auth
+
+    /** Opens the camera scanner. The result arrives in window.onQRResult(text, format) (text = null if cancelled). */
+    @android.webkit.JavascriptInterface
+    public void scanQR() {
+        if (!ok()) return;
+        a.runOnUiThread(a::startScan);
+    }
+
+    /** Fingerprint / face / PIN prompt. The result arrives in window.onBiometricResult(success, reason). */
+    @android.webkit.JavascriptInterface
+    public void biometricAuth(String title) {
+        if (!ok()) return;
+        a.runOnUiThread(() -> a.pageAuth(title));
+    }
+
+    // ------------------------------------------------------------------ background service
+
+    @android.webkit.JavascriptInterface
+    public void startBackground() {
+        if (!ok()) return;
+        a.runOnUiThread(() -> a.setBackground(true));
+    }
+
+    @android.webkit.JavascriptInterface
+    public void stopBackground() {
+        if (!ok()) return;
+        a.runOnUiThread(() -> a.setBackground(false));
+    }
+
+    /** Opens the system screen where the user can exempt the app from battery optimisation. */
+    @android.webkit.JavascriptInterface
+    public void openBatterySettings() {
+        if (!ok()) return;
+        a.runOnUiThread(() -> a.launch(new Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)));
+    }
+
+    /** Opens the Android print dialog for the current page (needs the printing option in the build). */
+    @android.webkit.JavascriptInterface
+    public void print() {
+        if (!ok()) return;
+        a.printPage(null);
     }
 }

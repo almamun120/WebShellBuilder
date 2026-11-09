@@ -6,12 +6,13 @@ import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
  * Minimal binary-XML (AXML) patcher for a compiled AndroidManifest.xml.
  *
- * It can: replace placeholder strings (package, label, versionName), change versionCode,
+ * It can: replace placeholder strings (package, label, versionName, deep-link host, share MIME types), change versionCode,
  * and drop {@code <uses-permission>} elements that are not in the allowed set.
  * Everything else is copied byte-for-byte, so the resource map and all string indices stay valid.
  */
@@ -29,6 +30,15 @@ public final class AxmlEditor {
 
     public static byte[] patch(byte[] in, String pkg, String label, String versionName,
                                int versionCode, Set<String> allowedPermissions) {
+        return patch(in, pkg, label, versionName, versionCode, allowedPermissions, java.util.Collections.emptyMap());
+    }
+
+    /**
+     * @param extra exact-match string replacements (placeholder to value), used for the deep-link
+     *              hosts and the share-target MIME types.
+     */
+    public static byte[] patch(byte[] in, String pkg, String label, String versionName,
+                               int versionCode, Set<String> allowedPermissions, Map<String, String> extra) {
         ByteBuffer b = ByteBuffer.wrap(in).order(ByteOrder.LITTLE_ENDIAN);
         if ((b.getShort(0) & 0xFFFF) != CH_FILE) throw new IllegalArgumentException("Not a binary XML file");
         int fileSize = b.getInt(4);
@@ -104,6 +114,11 @@ public final class AxmlEditor {
             if (s.equals(OLD_PACKAGE)) {
                 strings.set(i, pkg);
                 foundPkg = true;
+            } else if (s.startsWith(OLD_PACKAGE + ".")) {
+                // e.g. the content provider authority "<package>.share"
+                strings.set(i, pkg + s.substring(OLD_PACKAGE.length()));
+            } else if (extra.containsKey(s)) {
+                strings.set(i, extra.get(s));
             } else if (s.equals(OLD_LABEL)) {
                 strings.set(i, label);
             } else if (s.equals(OLD_VERSION_NAME)) {

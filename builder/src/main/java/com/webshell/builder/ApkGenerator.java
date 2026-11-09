@@ -57,11 +57,26 @@ final class ApkGenerator {
             if (me == null) throw new IllegalStateException("টেমপ্লেটে AndroidManifest.xml নেই");
             manifest = ApkPacker.readAll(zf.getInputStream(me));
         }
+        if (s.bgService) {
+            // the background service needs notifications (foreground notification + alerts) and a wake lock
+            s.perms.add("notifications");
+            s.perms.add("wakelock");
+        }
         Set<String> allowed = new HashSet<>();
         allowed.add("android.permission.INTERNET");
         allowed.add("android.permission.ACCESS_NETWORK_STATE");
         for (String key : s.perms) Collections.addAll(allowed, Perms.manifestNames(key));
-        manifest = AxmlEditor.patch(manifest, s.pkg, s.appName, s.versionName, s.versionCode, allowed);
+        if (!"none".equals(s.lock)) {
+            allowed.add("android.permission.USE_BIOMETRIC");
+            allowed.add("android.permission.USE_FINGERPRINT");
+        }
+        if (s.bgService) {
+            allowed.add("android.permission.FOREGROUND_SERVICE");
+            allowed.add("android.permission.FOREGROUND_SERVICE_DATA_SYNC");
+            if (s.bgOnBoot) allowed.add("android.permission.RECEIVE_BOOT_COMPLETED");
+        }
+        manifest = AxmlEditor.patch(manifest, s.pkg, s.appName, s.versionName, s.versionCode, allowed,
+                manifestPlaceholders(s));
 
         p.log("কনফিগ ও ছবি তৈরি হচ্ছে...");
         Map<String, byte[]> extra = new LinkedHashMap<>();
@@ -69,7 +84,8 @@ final class ApkGenerator {
         if (s.splashFile != null && s.splashFile.exists()) {
             Bitmap sb = BitmapFactory.decodeFile(s.splashFile.getAbsolutePath());
             if (sb != null) {
-                extra.put("assets/splash.png", png(scaleDown(sb, 720)));
+                boolean full = s.splashMode.startsWith("full");
+                extra.put("assets/splash.png", png(scaleDown(sb, full ? 1600 : 720)));
                 hasSplash = true;
             }
         }
@@ -111,6 +127,24 @@ final class ApkGenerator {
         return signed;
     }
 
+    /** Hosts for the deep-link filter and MIME types for the share-target filter in the template manifest. */
+    private static Map<String, String> manifestPlaceholders(BuildSpec s) {
+        Map<String, String> m = new HashMap<>();
+        String host = "";
+        try {
+            String h = new java.net.URI(s.url).getHost();
+            if (h != null) host = h.toLowerCase();
+        } catch (Exception ignored) {
+        }
+        String bare = host.startsWith("www.") ? host.substring(4) : host;
+        boolean links = s.deepLinks && !bare.isEmpty();
+        m.put("webshell-host-a.invalid", links ? bare : "deeplinks-off.invalid");
+        m.put("webshell-host-b.invalid", links ? "www." + bare : "deeplinks-off.invalid");
+        m.put("webshell/share-text", s.shareTarget ? "text/plain" : "webshell/off");
+        m.put("webshell/share-image", s.shareTarget ? "image/*" : "webshell/off");
+        return m;
+    }
+
     static String fileName(BuildSpec s) {
         String base = s.appName.replaceAll("[^A-Za-z0-9_\\-]", "");
         if (base.isEmpty()) base = s.pkg.replace('.', '_');
@@ -145,7 +179,58 @@ final class ApkGenerator {
         JSONArray perms = new JSONArray();
         for (String k : s.perms) perms.put(k);
         o.put("permissions", perms);
+
+        // texts: only written when the user typed something, otherwise the built-in default stays
+        putIfSet(o, "exitMessage", s.exitMessage);
+        putIfSet(o, "offlineTitle", s.offlineTitle);
+        putIfSet(o, "offlineMessage", s.offlineMessage);
+        putIfSet(o, "serverTitle", s.serverTitle);
+        putIfSet(o, "serverMessage", s.serverMessage);
+        putIfSet(o, "retryLabel", s.retryLabel);
+        putIfSet(o, "lockTitle", s.lockTitle);
+        putIfSet(o, "unlockLabel", s.unlockLabel);
+        putIfSet(o, "scanHint", s.scanHint);
+        putIfSet(o, "bgNotifText", s.bgNotifText);
+
+        o.put("splashMode", s.splashMode);
+        o.put("splashSize", s.splashSize);
+        o.put("splashSpinner", s.splashSpinner);
+
+        o.put("pullRefresh", s.pullRefresh);
+        o.put("theme", s.theme);
+        o.put("forceDarkWeb", s.forceDarkWeb);
+        o.put("lock", s.lock);
+        o.put("lockTimeoutSec", s.lockTimeoutSec);
+        o.put("offlineCache", s.offlineCache);
+        o.put("deepLinks", s.deepLinks);
+        o.put("shareTarget", s.shareTarget);
+        o.put("printing", s.printing);
+        o.put("mediaPlayer", s.mediaPlayer);
+        JSONArray ext = new JSONArray();
+        for (String e : s.mediaExt.split("[,;\\s]+")) {
+            String t = e.trim().toLowerCase();
+            if (t.startsWith(".")) t = t.substring(1);
+            if (!t.isEmpty()) ext.put(t);
+        }
+        o.put("mediaExt", ext);
+        o.put("navMode", s.navMode);
+        o.put("navItems", pairs(s.navItems));
+        o.put("shortcuts", pairs(s.shortcuts));
+        o.put("bgService", s.bgService);
+        o.put("bgOnBoot", s.bgOnBoot);
+        o.put("pollUrl", s.pollUrl);
+        o.put("pollSec", s.pollSec);
         return o.toString();
+    }
+
+    private static void putIfSet(JSONObject o, String key, String v) throws Exception {
+        if (v != null && !v.trim().isEmpty()) o.put(key, v.trim());
+    }
+
+    private static JSONArray pairs(java.util.List<String[]> list) throws Exception {
+        JSONArray a = new JSONArray();
+        for (String[] p : list) a.put(new JSONObject().put("title", p[0]).put("url", p[1]));
+        return a;
     }
 
     // ---------------------------------------------------------------- images

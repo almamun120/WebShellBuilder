@@ -30,5 +30,10 @@ android {
         checkReleaseBuilds = false
     }
 }
-// NOTE: no androidx / third-party dependencies on purpose. Libraries would add
+dependencies {
+    // Pure-Java barcode decoder for Android.scanQR(). It ships no manifest entries or resources,
+    // so repackaging the APK is not affected.
+    implementation("com.google.zxing:core:3.5.3")
+}
+// NOTE: no androidx / other third-party UI libraries on purpose. Libraries would add
 // extra manifest entries (permissions, providers) that break repackaging.

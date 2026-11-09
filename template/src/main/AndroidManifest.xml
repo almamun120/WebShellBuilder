@@ -27,6 +27,11 @@
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+    <uses-permission android:name="android.permission.USE_FINGERPRINT" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
@@ -52,11 +57,65 @@
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|keyboard|uiMode|density|layoutDirection|locale"
             android:exported="true"
             android:label="WebShellApp"
+            android:launchMode="singleTask"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!-- Notification taps and launcher shortcuts (our own explicit intents) -->
+            <intent-filter>
+                <action android:name="com.webshell.shell.OPEN_URL" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+
+            <!-- Deep links. The builder replaces the two placeholder hosts with the server host
+                 (or with a host that never matches when deep links are turned off). -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" />
+                <data android:scheme="http" />
+                <data android:host="webshell-host-a.invalid" />
+                <data android:host="webshell-host-b.invalid" />
+            </intent-filter>
+
+            <!-- Share target. The builder swaps the placeholder MIME types for text/plain and
+                 image/* (or for a type that never matches when sharing is turned off). -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="webshell/share-text" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="webshell/share-image" />
+            </intent-filter>
         </activity>
+
+        <!-- Files handed to other apps (Android.shareFile). The authority is rewritten with the package name. -->
+        <provider
+            android:name="com.webshell.shell.ShareProvider"
+            android:authorities="com.webshell.template.share"
+            android:exported="false"
+            android:grantUriPermissions="true" />
+
+        <!-- Background polling service (only started when enabled in the build) -->
+        <service
+            android:name="com.webshell.shell.PollService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <receiver
+            android:name="com.webshell.shell.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>
