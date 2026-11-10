@@ -7,8 +7,12 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
+import android.app.PictureInPictureParams;
+import android.app.RemoteAction;
 import android.content.ContentValues;
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.IntentFilter;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
@@ -39,6 +43,7 @@ import android.print.PrintManager;
 import android.provider.OpenableColumns;
 import android.provider.MediaStore;
 import android.util.Base64;
+import android.util.Rational;
 import android.util.SparseArray;
 import android.view.Gravity;
 import android.view.View;
@@ -109,6 +114,16 @@ public class MainActivity extends Activity {
     private ScannerView scanner;
     private BlobBridge blob;
     private MediaPlayerView media;
+    private PdfViewerView pdf;
+    private File pdfTemp;
+    private HttpFetch.Cancel pdfCancel;
+    private View savedBar;
+    private long lastDlAt;
+    private String lastDlUrl = "";
+    private boolean inPip;
+    private boolean pipEntering;
+    private boolean pipPending;
+    private BroadcastReceiver pipReceiver;
     private boolean locked;
     private boolean authBusy;
     private boolean promptOnResume;
@@ -223,15 +238,23 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         if (scanner != null) scanner.dismiss();
-        if (media != null) media.pause();
         CookieManager.getInstance().flush();
-        web.onPause();
+        // keep the page alive while it is shrinking into / showing in Picture-in-Picture
+        if (!pipEntering && !inPip) web.onPause();
         super.onPause();
     }
 
     @Override
     protected void onStop() {
         stoppedAt = SystemClock.elapsedRealtime();
+        if (Build.VERSION.SDK_INT >= 26 && isInPictureInPictureMode()) {
+            // the user closed the PiP window: stop what was playing there
+            if (media != null) closeMedia();
+            if (customView != null) chrome.onHideCustomView();
+            web.onPause();
+        } else if (media != null) {
+            media.onHostStopped(); // video pauses, audio keeps playing through MediaService
+        }
         super.onStop();
     }
 
@@ -285,6 +308,9 @@ public class MainActivity extends Activity {
         }
         removeScanner();
         closeMedia();
+        closePdf();
+        hideSavedBar();
+        unregisterPipReceiver();
         pull.removeView(web);
         web.destroy();
         super.onDestroy();
@@ -452,7 +478,7 @@ public class MainActivity extends Activity {
 
     private void updateNavVisibility() {
         if (navBar == null) return;
-        boolean show = splashGone && !locked && customView == null && media == null;
+        boolean show = splashGone && !locked && customView == null && media == null && pdf == null && !inPip;
         navBar.setVisibility(show ? View.VISIBLE : View.GONE);
     }
 
@@ -1006,22 +1032,15 @@ public class MainActivity extends Activity {
             web.addJavascriptInterface(br, "Android");
             web.addJavascriptInterface(br, "WebShell");
         }
-        if (cfg.printing) web.addJavascriptInterface(new PrintBridge(), "WebShellPrint");
+        // Printing, downloads of blob:/data:/PDF links and PiP are always available (see PageHooks).
+        web.addJavascriptInterface(new PrintBridge(web), "WebShellPrint");
+        web.addJavascriptInterface(new MediaBridge(), "WebShellMedia");
         blob = new BlobBridge(this);
-        web.addJavascriptInterface(blob, "WebShellDl"); // token-protected, used only for blob: downloads
+        web.addJavascriptInterface(blob, "WebShellDl");
         web.setWebViewClient(new Client());
         chrome = new Chrome();
         web.setWebChromeClient(chrome);
-        web.setDownloadListener((url, ua, cd, mime, len) -> {
-            if (cfg.mediaPlayer && !url.startsWith("blob:") && !url.startsWith("data:")) {
-                String fn = URLUtil.guessFileName(url, cd, mime);
-                if (isMediaUrl(url) || cfg.mediaExt.contains(extOf(fn))) {
-                    openMedia(url, fn);
-                    return;
-                }
-            }
-            startDownload(url, ua, cd, mime);
-        });
+        web.setDownloadListener((url, ua, cd, mime, len) -> onDownloadRequested(url, ua, cd, mime));
         pull.setOnRefreshListener(() -> {
             if (mainError || offlineView.getVisibility() == View.VISIBLE) retry();
             else web.reload();
@@ -1038,7 +1057,7 @@ public class MainActivity extends Activity {
         public void onPageStarted(WebView v, String url, Bitmap favicon) {
             mainError = false;
             currentUrl = url;
-            injectPrint();
+            injectHooks(web);
         }
 
         @Override
@@ -1048,7 +1067,7 @@ public class MainActivity extends Activity {
             if (!mainError) hideOffline();
             pageDone = true;
             pull.setRefreshing(false);
-            injectPrint();
+            injectHooks(web);
             updateNavSelection(url);
             dispatchShareIfReady();
             tryHideSplash();
@@ -1082,7 +1101,7 @@ public class MainActivity extends Activity {
         public void onProgressChanged(WebView v, int p) {
             progress.setProgress(p);
             progress.setVisibility(p < 100 ? View.VISIBLE : View.GONE);
-            if (p >= 40) injectPrint();
+            if (p >= 40) injectHooks(web);
         }
 
         @Override
@@ -1146,6 +1165,11 @@ public class MainActivity extends Activity {
             web.setVisibility(View.INVISIBLE);
             applySystemUi(true);
             updateNavVisibility();
+            updatePipParams();
+            if (pipPending) {
+                pipPending = false;
+                ui.postDelayed(MainActivity.this::enterPip, 350);
+            }
         }
 
         @Override
@@ -1157,17 +1181,61 @@ public class MainActivity extends Activity {
             web.setVisibility(View.VISIBLE);
             applySystemUi(false);
             updateNavVisibility();
+            updatePipParams();
         }
 
         @Override
         public boolean onCreateWindow(WebView v, boolean isDialog, boolean gesture, Message msg) {
-            WebView w = new WebView(MainActivity.this);
+            final WebView w = new WebView(MainActivity.this);
             configure(w.getSettings());
             CookieManager.getInstance().setAcceptThirdPartyCookies(w, true);
+            // The popup gets the same helpers as the main page: without a download listener a popup that
+            // opens a PDF / file (window.open(...), target=_blank) silently did nothing.
+            w.addJavascriptInterface(new PrintBridge(w), "WebShellPrint");
+            w.addJavascriptInterface(new MediaBridge(), "WebShellMedia");
+            w.addJavascriptInterface(blob, "WebShellDl");
+            w.setDownloadListener((url, ua, cd, mime, len) -> {
+                onDownloadRequested(url, ua, cd, mime);
+                // an empty popup that only existed to start the download is no longer needed
+                ui.postDelayed(() -> {
+                    String shown = w.getUrl();
+                    if (popup == w && (shown == null || shown.equals("about:blank") || shown.equals(url))) closePopup();
+                }, 400);
+            });
             w.setWebViewClient(new WebViewClient() {
                 @Override
                 public boolean shouldOverrideUrlLoading(WebView x, WebResourceRequest r) {
-                    return handleUrl(r.getUrl().toString(), false);
+                    String u = r.getUrl().toString();
+                    if (isBlobOrPdfUrl(u)) {
+                        onPageDownload(u, "", "", true);
+                        closePopup();
+                        return true;
+                    }
+                    return handleUrl(u, false);
+                }
+
+                @Override
+                public void onPageStarted(WebView x, String url, Bitmap favicon) {
+                    injectHooks(x);
+                    if (isBlobOrPdfUrl(url)) {
+                        x.stopLoading();
+                        onPageDownload(url, "", "", true);
+                        closePopup();
+                    }
+                }
+
+                @Override
+                public void onPageFinished(WebView x, String url) {
+                    injectHooks(x);
+                    // generators such as jsPDF 'dataurlnewwindow' write an <iframe src="data:application/pdf...">
+                    x.evaluateJavascript(PageHooks.FIND_EMBEDDED_PDF, value -> {
+                        if (value == null || popup != x) return;
+                        String src = value.length() >= 2 && value.startsWith("\"") ? value.substring(1, value.length() - 1) : value;
+                        if (!src.isEmpty() && !"null".equals(src)) {
+                            onPageDownload(src.replace("\\/", "/"), "", "application/pdf", true);
+                            closePopup();
+                        }
+                    });
                 }
 
                 @Override
@@ -1229,36 +1297,55 @@ public class MainActivity extends Activity {
         }
     }
 
-    // ------------------------------------------------------------------ printing
+    // ------------------------------------------------------------------ page hooks, printing, PiP bridge
 
-    private static final String PRINT_JS = "(function(){if(window.__wsPrint)return;window.__wsPrint=1;"
-            + "window.print=function(){try{WebShellPrint.print(document.title||'')}catch(e){}}})()";
+    /** Injects the download / print / PiP hooks into a page. Safe to call many times. */
+    void injectHooks(WebView w) {
+        if (w != null) w.evaluateJavascript(PageHooks.JS, null);
+    }
 
-    private final class PrintBridge {
+    /** window.print() from a page (main window or popup). */
+    public final class PrintBridge {
+        private final WebView target;
+
+        PrintBridge(WebView target) {
+            this.target = target;
+        }
+
         @JavascriptInterface
         public void print(String title) {
-            printPage(title);
+            printPage(target, title);
         }
     }
 
-    private void injectPrint() {
-        if (cfg.printing) web.evaluateJavascript(PRINT_JS, null);
+    /** video.requestPictureInPicture() from a page. */
+    public final class MediaBridge {
+        @JavascriptInterface
+        public void pip() {
+            runOnUiThread(MainActivity.this::pipForWebVideo);
+        }
     }
 
-    /** Opens the Android print dialog (printers, "Save as PDF") for the current page. */
-    void printPage(String title) {
+    /** Opens the Android print dialog (printers, "Save as PDF") for a WebView. */
+    void printPage(WebView target, String title) {
         runOnUiThread(() -> {
             try {
+                WebView t = target != null ? target : web;
                 String name = title != null && !title.isEmpty() ? title
-                        : (web.getTitle() != null && !web.getTitle().isEmpty() ? web.getTitle() : cfg.name);
+                        : (t.getTitle() != null && !t.getTitle().isEmpty() ? t.getTitle() : cfg.name);
                 PrintManager pm = (PrintManager) getSystemService(PRINT_SERVICE);
                 PrintAttributes attrs = new PrintAttributes.Builder()
                         .setMediaSize(PrintAttributes.MediaSize.ISO_A4).build();
-                pm.print(name, web.createPrintDocumentAdapter(name), attrs);
+                pm.print(name, t.createPrintDocumentAdapter(name), attrs);
             } catch (Exception e) {
                 Toast.makeText(this, "প্রিন্ট করা যায়নি", Toast.LENGTH_SHORT).show();
             }
         });
+    }
+
+    /** Used by Android.print() from the JS bridge. */
+    void printPage(String title) {
+        printPage(web, title);
     }
 
     // ------------------------------------------------------------------ built-in media player
@@ -1293,34 +1380,111 @@ public class MainActivity extends Activity {
     }
 
     private void openMedia(String url, String fileName) {
-        if (media != null) return;
-        String name = fileName != null && !fileName.isEmpty() ? fileName
-                : URLUtil.guessFileName(url, null, null);
-        boolean audio = isAudioExt(extOf(name)) || isAudioExt(extOf(Uri.parse(url).getPath()));
-        media = new MediaPlayerView(this, cfg.accent, name, audio, new MediaPlayerView.Listener() {
+        String name = fileName != null && !fileName.isEmpty() ? fileName : URLUtil.guessFileName(url, null, null);
+        List<MediaPlayerView.Item> one = new ArrayList<>();
+        one.add(new MediaPlayerView.Item(url, name));
+        openMediaList(one, 0);
+    }
+
+    /** Plays one file or a playlist in the built-in player. */
+    void openMediaList(List<MediaPlayerView.Item> list, int start) {
+        if (list == null || list.isEmpty()) return;
+        if (list.size() == 1 && start == 0) {
+            // a .m3u / .m3u8 / .pls / .xspf link may be a channel list: read it and play its entries
+            final MediaPlayerView.Item one = list.get(0);
+            if (PlaylistParser.isPlaylistPath(Uri.parse(one.url).getPath())) {
+                resolvePlaylist(one);
+                return;
+            }
+        }
+        openMediaNow(list, start);
+    }
+
+    private void resolvePlaylist(final MediaPlayerView.Item one) {
+        final String ua = web.getSettings().getUserAgentString();
+        final String cookie = CookieManager.getInstance().getCookie(one.url);
+        final String ref = currentUrl;
+        final File tmp = new File(getCacheDir(), "playlist_" + System.nanoTime() + ".txt");
+        final HttpFetch.Cancel cancel = new HttpFetch.Cancel();
+        web.postDelayed(() -> cancel.cancelled = true, 15000); // a live radio stream never ends: give up and just play the URL
+        new Thread(() -> {
+            List<MediaPlayerView.Item> parsed = new ArrayList<>();
+            try {
+                HttpFetch.Result r = HttpFetch.get(one.url, ua, cookie, ref, cfg.ignoreSsl, tmp, null, cancel);
+                if (r != null && tmp.length() < 2_000_000) parsed = PlaylistParser.parse(PlaylistParser.readText(tmp), one.url);
+            } catch (Exception ignored) {
+            } finally {
+                //noinspection ResultOfMethodCallIgnored
+                tmp.delete();
+            }
+            final List<MediaPlayerView.Item> res = parsed;
+            runOnUiThread(() -> {
+                if (isFinishing() || isDestroyed()) return;
+                if (res.isEmpty()) {
+                    List<MediaPlayerView.Item> single = new ArrayList<>();
+                    single.add(one); // an HLS manifest (or unreadable): let the player handle the URL itself
+                    openMediaNow(single, 0);
+                } else {
+                    openMediaNow(res, 0);
+                }
+            });
+        }, "playlist").start();
+    }
+
+    private void openMediaNow(List<MediaPlayerView.Item> list, int start) {
+        MediaPlayerView.Item first = list.get(Math.max(0, Math.min(start, list.size() - 1)));
+        Map<String, String> h = new HashMap<>();
+        String cookie = CookieManager.getInstance().getCookie(first.url);
+        if (cookie != null) h.put("Cookie", cookie);
+        h.put("User-Agent", web.getSettings().getUserAgentString());
+        if (currentUrl != null && !currentUrl.isEmpty()) h.put("Referer", currentUrl);
+        if (media != null) { // already open: just replace what is playing
+            media.play(list, start, h);
+            return;
+        }
+        boolean audio = isAudioExt(extOf(first.title)) || isAudioExt(extOf(Uri.parse(first.url).getPath()));
+        media = new MediaPlayerView(this, cfg.accent, audio, new MediaPlayerView.Listener() {
             @Override
             public void onClose() {
                 closeMedia();
             }
 
             @Override
-            public void onError() {
-                mediaFailed(url, name);
+            public void onError(String url, String title) {
+                mediaFailed(url, title);
             }
 
             @Override
-            public void onExternal() {
+            public void onExternal(String url) {
                 openExternally(url);
+            }
+
+            @Override
+            public void onDownload(String url, String title) {
+                startDownload(url, web.getSettings().getUserAgentString(), null, null, null);
+            }
+
+            @Override
+            public void onPip() {
+                enterPip();
+            }
+
+            @Override
+            public void onRotate() {
+                boolean land = getResources().getConfiguration().orientation == Configuration.ORIENTATION_LANDSCAPE;
+                setRequestedOrientation(land ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+                        : ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+            }
+
+            @Override
+            public void onStateChanged() {
+                updatePipParams();
             }
         });
         root.addView(media, new FrameLayout.LayoutParams(MATCH, MATCH));
         applySystemUi(true);
         updateNavVisibility();
-        Map<String, String> h = new HashMap<>();
-        String cookie = CookieManager.getInstance().getCookie(url);
-        if (cookie != null) h.put("Cookie", cookie);
-        h.put("User-Agent", web.getSettings().getUserAgentString());
-        media.play(Uri.parse(url), h);
+        media.play(list, start, h);
     }
 
     private void closeMedia() {
@@ -1329,8 +1493,17 @@ public class MainActivity extends Activity {
         media = null;
         m.release();
         root.removeView(m);
+        applyConfiguredOrientation();
         applySystemUi(customView != null);
         updateNavVisibility();
+        updatePipParams();
+    }
+
+    /** Puts the screen orientation back to what the build configured (the player's rotate button may have changed it). */
+    private void applyConfiguredOrientation() {
+        if ("portrait".equals(cfg.orientation)) setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT);
+        else if ("landscape".equals(cfg.orientation)) setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
+        else setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
     }
 
     private void openExternally(String url) {
@@ -1347,7 +1520,7 @@ public class MainActivity extends Activity {
                 .setMessage(name + "\nএই ফরম্যাট/লিংক ইন-বিল্ট প্লেয়ার সাপোর্ট করে না।")
                 .setPositiveButton("ডাউনলোড", (d, w) -> {
                     closeMedia();
-                    startDownload(url, web.getSettings().getUserAgentString(), null, null);
+                    startDownload(url, web.getSettings().getUserAgentString(), null, null, null);
                 })
                 .setNeutralButton("অন্য অ্যাপে খুলুন", (d, w) -> {
                     closeMedia();
@@ -1356,6 +1529,144 @@ public class MainActivity extends Activity {
                 .setNegativeButton("বন্ধ", (d, w) -> closeMedia())
                 .setOnCancelListener(d -> closeMedia())
                 .show();
+    }
+
+    // ------------------------------------------------------------------ Picture-in-Picture
+
+    private static final String PIP_PLAY = "com.webshell.shell.PIP_PLAY";
+    private static final String PIP_BACK = "com.webshell.shell.PIP_BACK";
+    private static final String PIP_FWD = "com.webshell.shell.PIP_FWD";
+
+    private boolean pipSupported() {
+        return Build.VERSION.SDK_INT >= 26
+                && getPackageManager().hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE);
+    }
+
+    /** True while a video (built-in player or a web page's fullscreen video) is on screen and playing. */
+    private boolean videoActive() {
+        return (media != null && media.isVideo() && media.isPlaying()) || customView != null;
+    }
+
+    void enterPip() {
+        if (!pipSupported() || locked || inPip) return;
+        if (media == null && customView == null) return;
+        try {
+            pipEntering = true;
+            enterPictureInPictureMode(buildPipParams());
+        } catch (Exception e) {
+            pipEntering = false;
+            Toast.makeText(this, "পিকচার-ইন-পিকচার চালু করা যায়নি", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    @Override
+    protected void onUserLeaveHint() {
+        super.onUserLeaveHint();
+        // Android 12+ enters PiP by itself (setAutoEnterEnabled); older versions need this call
+        if (Build.VERSION.SDK_INT < 31 && videoActive() && !inPip) enterPip();
+    }
+
+    private RemoteAction pipAction(int icon, String title, String action, int code) {
+        Intent i = new Intent(action).setPackage(getPackageName());
+        PendingIntent pi = PendingIntent.getBroadcast(this, code, i,
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+        return new RemoteAction(Icon.createWithResource(this, icon), title, title, pi);
+    }
+
+    private PictureInPictureParams buildPipParams() {
+        PictureInPictureParams.Builder b = new PictureInPictureParams.Builder();
+        float ar = 16f / 9f;
+        if (media != null && media.videoWidth() > 0 && media.videoHeight() > 0) {
+            ar = media.videoWidth() / (float) media.videoHeight();
+        }
+        ar = Math.max(0.42f, Math.min(2.39f, ar));
+        b.setAspectRatio(new Rational(Math.round(ar * 1000), 1000));
+        List<RemoteAction> actions = new ArrayList<>();
+        boolean playing = media != null ? media.isPlaying() : true;
+        if (media != null) actions.add(pipAction(android.R.drawable.ic_media_rew, "-10s", PIP_BACK, 11));
+        actions.add(pipAction(playing ? android.R.drawable.ic_media_pause : android.R.drawable.ic_media_play,
+                playing ? "Pause" : "Play", PIP_PLAY, 12));
+        if (media != null) actions.add(pipAction(android.R.drawable.ic_media_ff, "+10s", PIP_FWD, 13));
+        b.setActions(actions);
+        if (Build.VERSION.SDK_INT >= 31) b.setAutoEnterEnabled(videoActive());
+        return b.build();
+    }
+
+    /** Keeps the PiP window's shape / buttons and the auto-enter flag in sync with what is playing. */
+    void updatePipParams() {
+        if (!pipSupported()) return;
+        try {
+            if (media != null || customView != null) {
+                setPictureInPictureParams(buildPipParams());
+            } else if (Build.VERSION.SDK_INT >= 31) {
+                setPictureInPictureParams(new PictureInPictureParams.Builder().setAutoEnterEnabled(false).build());
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    @Override
+    public void onPictureInPictureModeChanged(boolean isInPip, Configuration newConfig) {
+        super.onPictureInPictureModeChanged(isInPip, newConfig);
+        inPip = isInPip;
+        pipEntering = false;
+        if (media != null) media.setPipMode(isInPip);
+        if (isInPip) {
+            registerPipReceiver();
+            hideSavedBar();
+        } else {
+            unregisterPipReceiver();
+        }
+        updateNavVisibility();
+    }
+
+    private void registerPipReceiver() {
+        if (pipReceiver != null) return;
+        pipReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context c, Intent i) {
+                String a = i.getAction();
+                if (a == null) return;
+                if (media != null) {
+                    if (PIP_PLAY.equals(a)) media.togglePlay();
+                    else if (PIP_BACK.equals(a)) media.seekBy(-10000);
+                    else if (PIP_FWD.equals(a)) media.seekBy(10000);
+                } else if (customView != null && PIP_PLAY.equals(a)) {
+                    web.evaluateJavascript("(function(){var v=document.querySelector('video');"
+                            + "if(v){if(v.paused)v.play();else v.pause()}})()", null);
+                }
+                updatePipParams();
+            }
+        };
+        IntentFilter f = new IntentFilter();
+        f.addAction(PIP_PLAY);
+        f.addAction(PIP_BACK);
+        f.addAction(PIP_FWD);
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(pipReceiver, f, Context.RECEIVER_NOT_EXPORTED);
+        else registerReceiver(pipReceiver, f);
+    }
+
+    private void unregisterPipReceiver() {
+        if (pipReceiver == null) return;
+        try {
+            unregisterReceiver(pipReceiver);
+        } catch (Exception ignored) {
+        }
+        pipReceiver = null;
+    }
+
+    /** video.requestPictureInPicture() from a page: take the video fullscreen first, then shrink it into PiP. */
+    void pipForWebVideo() {
+        if (!pipSupported()) return;
+        if (customView != null) {
+            enterPip();
+            return;
+        }
+        pipPending = true;
+        web.evaluateJavascript("(function(){var v=document.querySelector('video');if(!v)return;"
+                + "try{if(v.webkitEnterFullscreen)v.webkitEnterFullscreen();"
+                + "else if(v.requestFullscreen)v.requestFullscreen()}catch(e){}})()", null);
+        ui.postDelayed(() -> pipPending = false, 4000);
     }
 
     private static String hostTitle(String url) {
@@ -1390,6 +1701,10 @@ public class MainActivity extends Activity {
     private boolean handleUrl(String url, boolean allowExternal) {
         if (isMediaUrl(url)) {
             openMedia(url, null);
+            return true;
+        }
+        if (cfg.pdfViewer && isPdfUrl(url)) {
+            openPdfUrl(url, URLUtil.guessFileName(url, null, "application/pdf"));
             return true;
         }
         Uri u = Uri.parse(url);
@@ -1521,40 +1836,185 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void startDownload(String url, String ua, String cd, String mime) {
-        if (url.startsWith("blob:")) {
-            String fn = URLUtil.guessFileName("https://localhost/download", cd, mime);
-            web.evaluateJavascript(blob.prepare(url, fn, mime), null);
+    // ------------------------------------------------------------------ downloads & PDF
+
+    static boolean isPdfType(String mime, String name, String url) {
+        if (mime != null) {
+            String m = mime.toLowerCase(java.util.Locale.ROOT);
+            if (m.startsWith("application/pdf") || m.startsWith("application/x-pdf")) return true;
+        }
+        if (name != null && name.toLowerCase(java.util.Locale.ROOT).endsWith(".pdf")) return true;
+        return false;
+    }
+
+    /** http(s) URL whose path ends in .pdf. */
+    static boolean isPdfUrl(String url) {
+        if (url == null) return false;
+        String l = url.toLowerCase(java.util.Locale.ROOT);
+        if (!(l.startsWith("http://") || l.startsWith("https://"))) return false;
+        int cut = l.length();
+        int q = l.indexOf('?');
+        int f = l.indexOf('#');
+        if (q >= 0) cut = Math.min(cut, q);
+        if (f >= 0) cut = Math.min(cut, f);
+        return l.substring(0, cut).endsWith(".pdf");
+    }
+
+    private static boolean isBlobOrPdfUrl(String u) {
+        if (u == null) return false;
+        String l = u.toLowerCase(java.util.Locale.ROOT);
+        return l.startsWith("blob:") || l.startsWith("data:application/pdf") || isPdfUrl(u);
+    }
+
+    /** The WebView (main window or popup) hit a link it cannot show: decide between media player, PDF viewer and download. */
+    void onDownloadRequested(String url, String ua, String cd, String mime) {
+        if (url == null) return;
+        long now = SystemClock.elapsedRealtime();
+        if (url.equals(lastDlUrl) && now - lastDlAt < 1500) return; // the same click reported twice
+        lastDlUrl = url;
+        lastDlAt = now;
+        String lower = url.toLowerCase(java.util.Locale.ROOT);
+        boolean isHttp = lower.startsWith("http://") || lower.startsWith("https://");
+        String fn = URLUtil.guessFileName(isHttp ? url : "https://localhost/download", cd, mime);
+        if (cfg.mediaPlayer && isHttp && (isMediaUrl(url) || cfg.mediaExt.contains(extOf(fn)))) {
+            openMedia(url, fn);
+            return;
+        }
+        boolean attachment = cd != null && cd.toLowerCase(java.util.Locale.ROOT).contains("attachment");
+        if (cfg.pdfViewer && !attachment && isPdfType(mime, fn, url)) {
+            if (isHttp) {
+                openPdfUrl(url, fn);
+                return;
+            }
+            if (lower.startsWith("data:")) {
+                onPageDownload(url, fn, "application/pdf", true);
+                return;
+            }
+        }
+        startDownload(url, ua, cd, mime, null);
+    }
+
+    /**
+     * A page asked (through the injected hooks) to save or open a blob:/data:/http URL.
+     * view = true opens a PDF in the viewer, view = false saves the file.
+     */
+    void onPageDownload(String url, String name, String mime, boolean view) {
+        runOnUiThread(() -> {
+            if (url == null) return;
+            String l = url.toLowerCase(java.util.Locale.ROOT);
+            boolean isBlob = l.startsWith("blob:");
+            boolean isData = l.startsWith("data:");
+            boolean isHttp = l.startsWith("http://") || l.startsWith("https://");
+            if (!isBlob && !isData && !isHttp) return;
+            long now = SystemClock.elapsedRealtime();
+            String key = (view ? "v:" : "d:") + url;
+            if (key.equals(lastDlUrl) && now - lastDlAt < 1500) return;
+            lastDlUrl = key;
+            lastDlAt = now;
+            String fn = name == null || name.isEmpty() ? null : name;
+            String ua = web.getSettings().getUserAgentString();
+            if (!view) {
+                startDownload(url, ua, null, mime, fn);
+                return;
+            }
+            if (isHttp) {
+                if (cfg.pdfViewer) openPdfUrl(url, fn != null ? fn : URLUtil.guessFileName(url, null, "application/pdf"));
+                else startDownload(url, ua, null, mime, fn);
+            } else if (isData) {
+                try {
+                    FileSaver.Data d = FileSaver.parseDataUrl(url);
+                    String n = fn != null ? fn : URLUtil.guessFileName("https://localhost/document", null, d.mime);
+                    if (cfg.pdfViewer && isPdfType(d.mime, n, null)) {
+                        File f = new File(getCacheDir(), "view_" + System.nanoTime() + ".pdf");
+                        try (java.io.FileOutputStream o = new java.io.FileOutputStream(f)) {
+                            o.write(d.bytes);
+                        }
+                        openPdfFile(f, n.toLowerCase(java.util.Locale.ROOT).endsWith(".pdf") ? n : n + ".pdf", true);
+                    } else {
+                        saveBytes(n, d.mime, d.bytes);
+                    }
+                } catch (Exception e) {
+                    downloadFailed();
+                }
+            } else {
+                web.evaluateJavascript(blob.prepare(url, fn != null ? fn : "document.pdf", mime, true), null);
+            }
+        });
+    }
+
+    private void startDownload(String url, String ua, String cd, String mime, String explicitName) {
+        String lower = url.toLowerCase(java.util.Locale.ROOT);
+        boolean isHttp = lower.startsWith("http://") || lower.startsWith("https://");
+        String fn = explicitName != null ? explicitName
+                : URLUtil.guessFileName(isHttp ? url : "https://localhost/download", cd, mime);
+        if (lower.startsWith("blob:")) {
+            web.evaluateJavascript(blob.prepare(url, fn, mime, false), null);
             Toast.makeText(this, "ডাউনলোড শুরু হয়েছে", Toast.LENGTH_SHORT).show();
             return;
         }
-        if (url.startsWith("data:")) {
+        if (lower.startsWith("data:")) {
             try {
                 FileSaver.Data d = FileSaver.parseDataUrl(url);
-                saveBytes(URLUtil.guessFileName("https://localhost/download", cd, d.mime), d.mime, d.bytes);
+                saveBytes(explicitName != null ? explicitName
+                        : URLUtil.guessFileName("https://localhost/download", cd, d.mime), d.mime, d.bytes);
             } catch (Exception e) {
                 downloadFailed();
             }
             return;
         }
+        if (!isHttp) {
+            downloadFailed();
+            return;
+        }
+        // PDFs go through our own downloader so the "open / share" bar can be shown afterwards.
+        // Everything else uses the system DownloadManager (notification, resume), with the same fallback.
+        if (isPdfType(mime, fn, url)) {
+            downloadViaFetch(url, ua, fn, mime);
+            return;
+        }
+        final String name = fn;
         Runnable go = () -> {
             try {
                 DownloadManager.Request r = new DownloadManager.Request(Uri.parse(url));
-                r.setMimeType(mime);
+                if (mime != null && !mime.isEmpty()) r.setMimeType(mime);
                 String cookie = CookieManager.getInstance().getCookie(url);
                 if (cookie != null) r.addRequestHeader("Cookie", cookie);
                 r.addRequestHeader("User-Agent", ua);
-                String fn = URLUtil.guessFileName(url, cd, mime);
-                r.setTitle(fn);
+                if (currentUrl != null && !currentUrl.isEmpty()) r.addRequestHeader("Referer", currentUrl);
+                r.setTitle(name);
                 r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
-                r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fn);
+                r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name);
                 ((DownloadManager) getSystemService(DOWNLOAD_SERVICE)).enqueue(r);
                 Toast.makeText(this, "ডাউনলোড শুরু হয়েছে", Toast.LENGTH_SHORT).show();
             } catch (Exception e) {
-                Toast.makeText(this, "ডাউনলোড করা যায়নি", Toast.LENGTH_SHORT).show();
+                downloadViaFetch(url, ua, name, mime);
             }
         };
         withStorage(go, () -> Toast.makeText(this, "স্টোরেজ পারমিশন দরকার", Toast.LENGTH_SHORT).show());
+    }
+
+    /** Downloads an http(s) file ourselves (cookies, referer, redirects) and saves it into Downloads. */
+    private void downloadViaFetch(String url, String ua, String fn, String mime) {
+        Toast.makeText(this, "ডাউনলোড শুরু হয়েছে", Toast.LENGTH_SHORT).show();
+        final String cookie = CookieManager.getInstance().getCookie(url);
+        final String ref = currentUrl;
+        withStorage(() -> new Thread(() -> {
+            File tmp = new File(getCacheDir(), "dl_" + System.nanoTime() + ".part");
+            try {
+                HttpFetch.Result r = HttpFetch.get(url, ua, cookie, ref, cfg.ignoreSsl, tmp, null, null);
+                String m = !r.mime.isEmpty() ? r.mime : mime;
+                boolean expectPdf = isPdfType(mime, fn, url);
+                if (expectPdf && !PdfViewerView.isPdf(tmp)) throw new java.io.IOException("not a pdf");
+                if (!expectPdf && m != null && m.startsWith("text/html") && !fn.toLowerCase(java.util.Locale.ROOT).endsWith(".html")) {
+                    throw new java.io.IOException("html instead of file");
+                }
+                saveDownloadedFile(tmp, fn, expectPdf ? "application/pdf" : m);
+            } catch (Exception e) {
+                //noinspection ResultOfMethodCallIgnored
+                tmp.delete();
+                downloadFailed();
+            }
+        }).start(), () -> Toast.makeText(this, "স্টোরেজ পারমিশন দরকার", Toast.LENGTH_SHORT).show());
     }
 
     /** Android 9 and older need the storage permission to write into Downloads. */
@@ -1571,20 +2031,18 @@ public class MainActivity extends Activity {
     void saveBytes(String name, String mime, byte[] data) {
         runOnUiThread(() -> withStorage(() -> new Thread(() -> {
             try {
-                String where = FileSaver.saveToDownloads(this, name, mime, data);
-                fileSaved(name, where);
+                fileSaved(FileSaver.saveToDownloads(this, name, mime, data));
             } catch (Exception e) {
                 downloadFailed();
             }
         }).start(), () -> Toast.makeText(this, "স্টোরেজ পারমিশন দরকার", Toast.LENGTH_SHORT).show()));
     }
 
-    /** Saves a finished temp file (blob download) into Downloads and deletes the temp file. */
+    /** Saves a finished temp file (blob / own download) into Downloads and deletes the temp file. */
     void saveDownloadedFile(File f, String name, String mime) {
         runOnUiThread(() -> withStorage(() -> new Thread(() -> {
             try {
-                String where = FileSaver.saveToDownloads(this, name, mime, f);
-                fileSaved(name, where);
+                fileSaved(FileSaver.saveToDownloads(this, name, mime, f));
             } catch (Exception e) {
                 downloadFailed();
             } finally {
@@ -1598,9 +2056,207 @@ public class MainActivity extends Activity {
         }));
     }
 
-    private void fileSaved(String name, String where) {
-        runOnUiThread(() -> Toast.makeText(this, "সংরক্ষিত: " + where, Toast.LENGTH_LONG).show());
-        js("window.onFileSaved&&window.onFileSaved(" + JSONObject.quote(name) + ")");
+    private void fileSaved(FileSaver.Saved s) {
+        runOnUiThread(() -> showSavedBar(s));
+        js("window.onFileSaved&&window.onFileSaved(" + JSONObject.quote(s.name) + ")");
+    }
+
+    private Runnable hideSavedTask;
+
+    /** Bottom bar: "✔ report.pdf  [খুলুন] [শেয়ার]". Disappears after a few seconds. */
+    private void showSavedBar(FileSaver.Saved s) {
+        hideSavedBar();
+        if (s.copy == null) {
+            Toast.makeText(this, "সংরক্ষিত: " + s.where, Toast.LENGTH_LONG).show();
+            return;
+        }
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setGravity(Gravity.CENTER_VERTICAL);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0xF2202733);
+        bg.setCornerRadius(dp(14));
+        bar.setBackground(bg);
+        bar.setPadding(dp(14), dp(6), dp(6), dp(6));
+        bar.setElevation(dp(8));
+
+        TextView t = new TextView(this);
+        t.setText("✔ " + s.name);
+        t.setTextColor(Color.WHITE);
+        t.setTextSize(14);
+        t.setSingleLine(true);
+        t.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
+        bar.addView(t, new LinearLayout.LayoutParams(0, WRAP, 1f));
+
+        TextView open = barButton("খুলুন");
+        open.setOnClickListener(v -> {
+            hideSavedBar();
+            openSaved(s);
+        });
+        bar.addView(open);
+        TextView share = barButton("শেয়ার");
+        share.setOnClickListener(v -> {
+            hideSavedBar();
+            FileSaver.shareFile(this, s.copy, s.mime);
+        });
+        bar.addView(share);
+
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(MATCH, WRAP, Gravity.BOTTOM);
+        lp.leftMargin = dp(12);
+        lp.rightMargin = dp(12);
+        lp.bottomMargin = dp(navBar != null && navBar.getVisibility() == View.VISIBLE ? 84 : 24);
+        root.addView(bar, lp);
+        savedBar = bar;
+        hideSavedTask = this::hideSavedBar;
+        ui.postDelayed(hideSavedTask, 8000);
+    }
+
+    private TextView barButton(String label) {
+        TextView b = new TextView(this);
+        b.setText(label);
+        b.setTextColor(cfg.accent);
+        b.setTextSize(14);
+        b.setTypeface(Typeface.DEFAULT_BOLD);
+        b.setGravity(Gravity.CENTER);
+        b.setPadding(dp(14), dp(10), dp(14), dp(10));
+        return b;
+    }
+
+    private void hideSavedBar() {
+        if (hideSavedTask != null) {
+            ui.removeCallbacks(hideSavedTask);
+            hideSavedTask = null;
+        }
+        if (savedBar != null) {
+            root.removeView(savedBar);
+            savedBar = null;
+        }
+    }
+
+    private void openSaved(FileSaver.Saved s) {
+        if (cfg.pdfViewer && isPdfType(s.mime, s.name, null) && PdfViewerView.isPdf(s.copy)) {
+            openPdfFile(s.copy, s.name, false);
+        } else if (!FileSaver.viewFile(this, s.copy, s.mime)) {
+            Toast.makeText(this, "খোলার মতো অ্যাপ পাওয়া যায়নি", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    // ---- PDF viewer
+
+    private void showPdfViewer(String title) {
+        pdf = new PdfViewerView(this, cfg.accent, title, new PdfViewerView.Listener() {
+            @Override
+            public void onClose() {
+                closePdf();
+            }
+
+            @Override
+            public void onDownload(File f, String name) {
+                final String n = name.toLowerCase(java.util.Locale.ROOT).endsWith(".pdf") ? name : name + ".pdf";
+                withStorage(() -> new Thread(() -> {
+                    try {
+                        fileSaved(FileSaver.saveToDownloads(MainActivity.this, n, "application/pdf", f));
+                    } catch (Exception e) {
+                        downloadFailed();
+                    }
+                }).start(), () -> Toast.makeText(MainActivity.this, "স্টোরেজ পারমিশন দরকার", Toast.LENGTH_SHORT).show());
+            }
+
+            @Override
+            public void onShare(File f, String name) {
+                try {
+                    FileSaver.shareAny(MainActivity.this, f, name, "application/pdf");
+                } catch (Exception e) {
+                    Toast.makeText(MainActivity.this, "শেয়ার করা যায়নি", Toast.LENGTH_SHORT).show();
+                }
+            }
+
+            @Override
+            public void onPrint(File f, String name) {
+                try {
+                    PrintManager pm = (PrintManager) getSystemService(PRINT_SERVICE);
+                    pm.print(name, new PdfPrintAdapter(f, name), null);
+                } catch (Exception e) {
+                    Toast.makeText(MainActivity.this, "প্রিন্ট করা যায়নি", Toast.LENGTH_SHORT).show();
+                }
+            }
+
+            @Override
+            public void onExternal(File f, String name) {
+                if (!FileSaver.viewAny(MainActivity.this, f, name, "application/pdf")) {
+                    Toast.makeText(MainActivity.this, "PDF খোলার মতো অ্যাপ পাওয়া যায়নি", Toast.LENGTH_SHORT).show();
+                }
+            }
+        });
+        root.addView(pdf, new FrameLayout.LayoutParams(MATCH, MATCH));
+        updateNavVisibility();
+    }
+
+    /** Opens a local PDF file in the viewer. {@code temp} files are deleted when the viewer closes. */
+    void openPdfFile(File f, String name, boolean temp) {
+        runOnUiThread(() -> {
+            if (!cfg.pdfViewer) {
+                saveDownloadedFile(f, name, "application/pdf");
+                return;
+            }
+            closePdf();
+            showPdfViewer(name);
+            pdfTemp = temp ? f : null;
+            pdf.load(f);
+        });
+    }
+
+    /** Downloads a PDF (showing progress inside the viewer) and then displays it. */
+    void openPdfUrl(String url, String name) {
+        closePdf();
+        showPdfViewer(name == null || name.isEmpty() ? "document.pdf" : name);
+        final PdfViewerView v = pdf;
+        final HttpFetch.Cancel cancel = new HttpFetch.Cancel();
+        pdfCancel = cancel;
+        final File tmp = new File(getCacheDir(), "view_" + System.nanoTime() + ".pdf");
+        pdfTemp = tmp;
+        final String ua = web.getSettings().getUserAgentString();
+        final String cookie = CookieManager.getInstance().getCookie(url);
+        final String ref = currentUrl;
+        new Thread(() -> {
+            try {
+                HttpFetch.get(url, ua, cookie, ref, cfg.ignoreSsl, tmp,
+                        (done, total, pct) -> runOnUiThread(() -> {
+                            if (pdf == v) v.setProgress(pct);
+                        }), cancel);
+                runOnUiThread(() -> {
+                    if (pdf != v) return;
+                    if (PdfViewerView.isPdf(tmp)) {
+                        v.load(tmp);
+                    } else {
+                        closePdf();
+                        Toast.makeText(this, "এই লিংকে PDF পাওয়া যায়নি", Toast.LENGTH_SHORT).show();
+                    }
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    if (pdf != v || cancel.cancelled) return;
+                    closePdf();
+                    Toast.makeText(this, "PDF লোড করা যায়নি", Toast.LENGTH_SHORT).show();
+                });
+            }
+        }).start();
+    }
+
+    private void closePdf() {
+        if (pdf == null) return;
+        if (pdfCancel != null) pdfCancel.cancelled = true;
+        pdfCancel = null;
+        PdfViewerView v = pdf;
+        pdf = null;
+        v.release();
+        root.removeView(v);
+        if (pdfTemp != null) {
+            //noinspection ResultOfMethodCallIgnored
+            pdfTemp.delete();
+            pdfTemp = null;
+        }
+        updateNavVisibility();
     }
 
     // ------------------------------------------------------------------ permissions
@@ -1683,6 +2339,10 @@ public class MainActivity extends Activity {
         }
         if (scanner != null) {
             scanner.dismiss();
+            return;
+        }
+        if (pdf != null) {
+            closePdf();
             return;
         }
         if (media != null) {

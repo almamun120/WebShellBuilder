@@ -70,6 +70,12 @@ final class ApkGenerator {
             allowed.add("android.permission.USE_BIOMETRIC");
             allowed.add("android.permission.USE_FINGERPRINT");
         }
+        if (s.mediaPlayer) {
+            // lets audio keep playing in the background with a media notification
+            allowed.add("android.permission.FOREGROUND_SERVICE");
+            allowed.add("android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK");
+            allowed.add("android.permission.WAKE_LOCK");
+        }
         if (s.bgService) {
             allowed.add("android.permission.FOREGROUND_SERVICE");
             allowed.add("android.permission.FOREGROUND_SERVICE_DATA_SYNC");
@@ -204,7 +210,8 @@ final class ApkGenerator {
         o.put("offlineCache", s.offlineCache);
         o.put("deepLinks", s.deepLinks);
         o.put("shareTarget", s.shareTarget);
-        o.put("printing", s.printing);
+        o.put("printing", true);
+        o.put("pdfViewer", s.pdfViewer);
         o.put("mediaPlayer", s.mediaPlayer);
         JSONArray ext = new JSONArray();
         for (String e : s.mediaExt.split("[,;\\s]+")) {

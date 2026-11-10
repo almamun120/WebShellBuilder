@@ -437,10 +437,70 @@ public class Bridge {
         a.runOnUiThread(() -> a.launch(new Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)));
     }
 
-    /** Opens the Android print dialog for the current page (needs the printing option in the build). */
+    /** Opens the Android print dialog for the current page (also what window.print() does). */
     @android.webkit.JavascriptInterface
     public void print() {
         if (!ok()) return;
         a.printPage(null);
+    }
+
+    /** Opens a PDF (http(s) URL) in the built-in viewer, which has download / share / print buttons. */
+    @android.webkit.JavascriptInterface
+    public void openPdf(String url) {
+        if (!ok() || url == null) return;
+        a.onPageDownload(url, "", "application/pdf", true);
+    }
+
+    /** Saves any http(s) / blob: / data: URL into Downloads. fileName is optional. */
+    @android.webkit.JavascriptInterface
+    public void downloadFile(String url, String fileName) {
+        if (!ok() || url == null) return;
+        a.onPageDownload(url, fileName == null ? "" : fileName, "", false);
+    }
+
+    /** Plays one audio / video URL in the built-in player. */
+    @android.webkit.JavascriptInterface
+    public void playMedia(String url, String title) {
+        if (!ok() || url == null || !url.matches("(?i)^https?://.*")) return;
+        a.runOnUiThread(() -> {
+            java.util.List<MediaPlayerView.Item> one = new java.util.ArrayList<>();
+            one.add(new MediaPlayerView.Item(url, title));
+            a.openMediaList(one, 0);
+        });
+    }
+
+    /**
+     * Plays a playlist. json is an array of URLs or of {url, title} objects; index is the first item.
+     * Next / previous buttons and auto-advance are enabled automatically.
+     */
+    @android.webkit.JavascriptInterface
+    public void playMediaList(String json, int index) {
+        if (!ok() || json == null) return;
+        try {
+            org.json.JSONArray arr = new org.json.JSONArray(json);
+            final java.util.List<MediaPlayerView.Item> list = new java.util.ArrayList<>();
+            for (int i = 0; i < arr.length(); i++) {
+                Object o = arr.get(i);
+                String u;
+                String t = "";
+                if (o instanceof org.json.JSONObject) {
+                    u = ((org.json.JSONObject) o).optString("url", "");
+                    t = ((org.json.JSONObject) o).optString("title", "");
+                } else {
+                    u = String.valueOf(o);
+                }
+                if (u.matches("(?i)^https?://.*")) list.add(new MediaPlayerView.Item(u, t.isEmpty() ? android.webkit.URLUtil.guessFileName(u, null, null) : t));
+            }
+            if (list.isEmpty()) return;
+            a.runOnUiThread(() -> a.openMediaList(list, index));
+        } catch (Exception ignored) {
+        }
+    }
+
+    /** Puts the playing video (or the page's fullscreen video) into Picture-in-Picture. */
+    @android.webkit.JavascriptInterface
+    public void enterPip() {
+        if (!ok()) return;
+        a.runOnUiThread(a::pipForWebVideo);
     }
 }

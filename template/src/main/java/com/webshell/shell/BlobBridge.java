@@ -13,15 +13,19 @@ import java.io.OutputStream;
 import java.util.UUID;
 
 /**
- * Receives the bytes of a blob: download from the page, in chunks. Exposed to every page as
- * "WebShellDl", but each call must carry the one-time token of the download that is in progress,
- * so a page cannot use it on its own.
+ * Download bridge, exposed to pages as "WebShellDl".
+ *
+ * request()/view() are called by the injected hooks (see PageHooks) when a page wants to save or open
+ * a blob:/data:/PDF URL. The blob bytes themselves are received in chunks through begin/chunk/end,
+ * and every one of those calls must carry the one-time token of the transfer that is in progress,
+ * so a page cannot feed data in on its own.
  */
-final class BlobBridge {
+public final class BlobBridge {
     private final MainActivity a;
     private String token = "";
     private String name = "";
     private String mime = "";
+    private boolean viewMode;
     private File tmp;
     private OutputStream out;
     private boolean failed;
@@ -30,12 +34,13 @@ final class BlobBridge {
         this.a = a;
     }
 
-    /** Builds the script that makes the page hand over the blob. */
-    synchronized String prepare(String url, String fileName, String mimeType) {
+    /** Builds the script that makes the page hand over the blob (cached Blob object first, XHR as fallback). */
+    synchronized String prepare(String url, String fileName, String mimeType, boolean view) {
         close(true);
         token = UUID.randomUUID().toString();
         name = fileName;
         mime = mimeType == null ? "" : mimeType;
+        viewMode = view;
         failed = false;
         try {
             tmp = new File(a.getCacheDir(), "dl_" + System.nanoTime() + ".part");
@@ -45,18 +50,36 @@ final class BlobBridge {
         }
         String T = JSONObject.quote(token);
         String U = JSONObject.quote(url);
-        return "(function(){var T=" + T + ",U=" + U + ";try{var x=new XMLHttpRequest();x.open('GET',U,true);"
-                + "x.responseType='blob';x.onerror=function(){WebShellDl.fail(T)};"
-                + "x.onload=function(){var b=x.response;if(!b){WebShellDl.fail(T);return}"
-                + "WebShellDl.begin(T,b.type||'');var r=new FileReader();r.onerror=function(){WebShellDl.fail(T)};"
-                + "r.onloadend=function(){var s=String(r.result||''),i=s.indexOf(',')+1,n=262144;"
-                + "for(var p=i;p<s.length;p+=n){WebShellDl.chunk(T,s.substring(p,p+n))}WebShellDl.end(T)};"
-                + "r.readAsDataURL(b)};x.send()}catch(e){WebShellDl.fail(T)}})();";
+        return "(function(){var T=" + T + ",U=" + U + ";"
+                + "function F(){WebShellDl.fail(T)}"
+                + "function S(b){try{WebShellDl.begin(T,b.type||'');var r=new FileReader();r.onerror=F;"
+                + "r.onloadend=function(){try{var s=String(r.result||''),i=s.indexOf(',')+1,n=262144;"
+                + "for(var p=i;p<s.length;p+=n){WebShellDl.chunk(T,s.substring(p,p+n))}WebShellDl.end(T)}catch(e){F()}};"
+                + "r.readAsDataURL(b)}catch(e){F()}}"
+                + "try{var c=window.__wsBlobs&&window.__wsBlobs[U];if(c){S(c);return}"
+                + "var x=new XMLHttpRequest();x.open('GET',U,true);x.responseType='blob';x.onerror=F;"
+                + "x.onload=function(){x.response?S(x.response):F()};x.send()}catch(e){F()}})();";
     }
 
     private boolean valid(String t) {
         return t != null && !token.isEmpty() && token.equals(t);
     }
+
+    // ---------------------------------------------------------------- called by the page hooks
+
+    /** The page wants to SAVE this url (a[download], jsPDF.save(), FileSaver...). */
+    @JavascriptInterface
+    public void request(String url, String fileName, String mimeType) {
+        a.onPageDownload(url, fileName, mimeType, false);
+    }
+
+    /** The page wants to OPEN this url (window.open of a PDF). */
+    @JavascriptInterface
+    public void view(String url, String fileName, String mimeType) {
+        a.onPageDownload(url, fileName, mimeType, true);
+    }
+
+    // ---------------------------------------------------------------- token protected transfer
 
     @JavascriptInterface
     public synchronized void begin(String t, String blobType) {
@@ -83,6 +106,7 @@ final class BlobBridge {
         tmp = null;
         String n = name;
         String m = mime;
+        boolean view = viewMode;
         boolean bad = failed;
         close(false);
         token = "";
@@ -94,7 +118,13 @@ final class BlobBridge {
             a.downloadFailed();
             return;
         }
-        a.saveDownloadedFile(f, n, m);
+        // a blob with no declared type may still be a PDF: look at the first bytes
+        if (PdfViewerView.isPdf(f)) {
+            m = "application/pdf";
+            if (!n.toLowerCase().endsWith(".pdf")) n = n + ".pdf";
+        }
+        if (view && "application/pdf".equals(m)) a.openPdfFile(f, n, true);
+        else a.saveDownloadedFile(f, n, m);
     }
 
     @JavascriptInterface

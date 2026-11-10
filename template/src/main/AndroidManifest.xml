@@ -31,6 +31,7 @@
     <uses-permission android:name="android.permission.USE_FINGERPRINT" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <uses-feature android:name="android.hardware.camera" android:required="false" />
@@ -58,6 +59,8 @@
             android:exported="true"
             android:label="WebShellApp"
             android:launchMode="singleTask"
+            android:resizeableActivity="true"
+            android:supportsPictureInPicture="true"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -103,6 +106,12 @@
             android:authorities="com.webshell.template.share"
             android:exported="false"
             android:grantUriPermissions="true" />
+
+        <!-- Keeps audio playing in the background and shows the media notification -->
+        <service
+            android:name="com.webshell.shell.MediaService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
 
         <!-- Background polling service (only started when enabled in the build) -->
         <service

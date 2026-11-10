@@ -258,7 +258,7 @@ public class MainActivity extends Activity {
         choice(c3, "theme", "থিম (ডার্ক/লাইট মোড)", THEME_LABELS);
         sw(c3, "forceDark", "ডার্ক মোডে সাইটকেও জোর করে ডার্ক করুন (যেসব সাইটে ডার্ক থিম নেই)", false);
         sw(c3, "offlineCache", "অফলাইন ক্যাশ: নেট না থাকলে আগে খোলা পেজ দেখান", false);
-        sw(c3, "printing", "প্রিন্ট সাপোর্ট: window.print() ও Android.print() প্রিন্ট/PDF ডায়ালগ খুলবে", false);
+        sw(c3, "pdf", "PDF লিংক ইন-অ্যাপ PDF ভিউয়ারে খুলুন (ডাউনলোড/শেয়ার/প্রিন্টসহ); বন্ধ থাকলে সরাসরি ডাউনলোড হবে", true);
         sw(c3, "keepOn", "স্ক্রিন সবসময় চালু রাখুন", false);
         sw(c3, "js", "JavaScript ব্রিজ (window.Android) চালু", true);
         sw(c3, "desktop", "ডেস্কটপ সাইট মোড", false);
@@ -270,8 +270,8 @@ public class MainActivity extends Activity {
 
         // ---- media / lock / navigation
         LinearLayout c5 = card(root, "মিডিয়া, লক ও নেভিগেশন");
-        sw(c5, "media", "ইন-বিল্ট অডিও/ভিডিও প্লেয়ার (নিচের এক্সটেনশনের লিংক ডাউনলোড না হয়ে প্লেয়ারে চলবে)", false);
-        field(c5, "mediaExt", "মিডিয়া এক্সটেনশন (কমা দিয়ে)", "mp3,mp4,m4a,webm,mkv,m3u8", "mp3,mp4,m4a,aac,wav,ogg,flac,webm,mkv,3gp,m3u8", InputType.TYPE_CLASS_TEXT);
+        sw(c5, "media", "ইন-বিল্ট অডিও/ভিডিও প্লেয়ার: নিচের এক্সটেনশনের লিংক প্লেয়ারে চলবে (PiP, ব্যাকগ্রাউন্ড অডিও, জেসচার, স্পিড, প্লেলিস্ট, সাবটাইটেল)", false);
+        field(c5, "mediaExt", "মিডিয়া এক্সটেনশন (কমা দিয়ে)", "mp3,mp4,m4a,webm,mkv,m3u8,m3u,mpd", "mp3,mp4,m4a,aac,wav,ogg,flac,webm,mkv,3gp,m3u8,m3u,pls,xspf,mpd", InputType.TYPE_CLASS_TEXT);
         choice(c5, "lock", "অ্যাপ লক", LOCK_LABELS);
         field(c5, "lockSec", "ব্যাকগ্রাউন্ডে কত সেকেন্ড থাকলে আবার লক হবে (০ = সবসময়)", "30", "30", InputType.TYPE_CLASS_NUMBER);
         choice(c5, "navMode", "নেভিগেশন বার", NAV_LABELS);
@@ -533,7 +533,8 @@ public class MainActivity extends Activity {
         s.theme = pick("theme", THEME_VALUES);
         s.forceDarkWeb = on("forceDark");
         s.offlineCache = on("offlineCache");
-        s.printing = on("printing");
+        s.printing = true;           // window.print() always opens the print / Save-as-PDF dialog
+        s.pdfViewer = on("pdf");
         s.mediaPlayer = on("media");
         s.mediaExt = val("mediaExt");
         if (s.mediaPlayer && s.mediaExt.isEmpty()) {

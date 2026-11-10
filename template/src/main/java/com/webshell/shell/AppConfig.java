@@ -10,6 +10,7 @@ import org.json.JSONObject;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -72,7 +73,8 @@ final class AppConfig {
     boolean splashSpinner = true;
 
     // --- printing and built-in media player ---
-    boolean printing = false;
+    boolean printing = true;      // always on: window.print() is routed to the Android print dialog
+    boolean pdfViewer = true;     // PDF links / blobs open in the built-in viewer (false = download directly)
     boolean mediaPlayer = false;
     final java.util.Set<String> mediaExt = new java.util.HashSet<>();
     final Set<String> perms = new HashSet<>();
@@ -133,7 +135,8 @@ final class AppConfig {
             a.splashMode = o.optString("splashMode", "logo");
             a.splashSize = Math.max(40, Math.min(600, o.optInt("splashSize", 180)));
             a.splashSpinner = o.optBoolean("splashSpinner", true);
-            a.printing = o.optBoolean("printing", false);
+            a.printing = true;
+            a.pdfViewer = o.optBoolean("pdfViewer", true);
             a.mediaPlayer = o.optBoolean("mediaPlayer", false);
             JSONArray me = o.optJSONArray("mediaExt");
             if (me != null) {
@@ -142,6 +145,10 @@ final class AppConfig {
                     if (e.startsWith(".")) e = e.substring(1);
                     if (!e.isEmpty()) a.mediaExt.add(e);
                 }
+            }
+            if (a.mediaPlayer && !a.mediaExt.isEmpty()) {
+                // playlist files and DASH manifests only make sense for the player
+                Collections.addAll(a.mediaExt, "m3u", "pls", "xspf", "mpd");
             }
             JSONArray p = o.optJSONArray("permissions");
             if (p != null) for (int i = 0; i < p.length(); i++) a.perms.add(p.getString(i));

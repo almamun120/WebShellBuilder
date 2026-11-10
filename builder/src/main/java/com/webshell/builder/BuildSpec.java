@@ -59,7 +59,8 @@ final class BuildSpec {
     boolean offlineCache;
     boolean deepLinks;
     boolean shareTarget;
-    boolean printing;
+    boolean printing = true;
+    boolean pdfViewer = true;
     boolean mediaPlayer;
     String mediaExt = "";             // comma separated, e.g. "mp3,mp4,m3u8"
     String navMode = "none";          // none | bottom

@@ -79,7 +79,9 @@ public final class AxmlEditor {
                                 if (rawIdx >= 0) name = strings.get(rawIdx);
                             }
                         }
-                        if (name != null && !allowedPermissions.contains(name)) {
+                        boolean libInternal = name != null && name.startsWith(OLD_PACKAGE + ".")
+                                && name.endsWith(".DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"); // added by androidx.core
+                        if (name != null && !libInternal && !allowedPermissions.contains(name)) {
                             skipDepth = 1; // drop this element and its end tag
                             pos += size;
                             continue;
