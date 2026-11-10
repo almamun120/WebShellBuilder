@@ -1071,7 +1071,7 @@ final class MediaPlayerView extends FrameLayout implements TextureView.SurfaceTe
 
     private void startPlayback() {
         if (mp == null || !prepared || released) return;
-        if (!requestFocus()) {
+        if (!requestAudioFocusNow()) {
             toastHud("অডিও ফোকাস পাওয়া যায়নি");
         }
         try {
@@ -1296,7 +1296,7 @@ final class MediaPlayerView extends FrameLayout implements TextureView.SurfaceTe
 
     // ------------------------------------------------------------------ audio focus / noisy / session
 
-    private boolean requestFocus() {
+    private boolean requestAudioFocusNow() {
         try {
             if (Build.VERSION.SDK_INT >= 26) {
                 if (focusReq == null) {
